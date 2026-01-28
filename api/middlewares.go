@@ -3,9 +3,9 @@ package api
 import (
 	"time"
 
-	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/metrics"
-	"github.com/microservices-demo/user/users"
+	"github.com/go-kit/log"
+	"github.com/mikesay/user/users"
 )
 
 // Middleware decorates a service.

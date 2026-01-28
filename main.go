@@ -12,16 +12,28 @@ import (
 
 	corelog "log"
 
-	"github.com/go-kit/kit/log"
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
-	"github.com/microservices-demo/user/api"
-	"github.com/microservices-demo/user/db"
-	"github.com/microservices-demo/user/db/mongodb"
+	"github.com/go-kit/log"
+	"github.com/mikesay/user/api"
+	"github.com/mikesay/user/db"
+	"github.com/mikesay/user/db/mongodb"
+
 	stdopentracing "github.com/opentracing/opentracing-go"
-	zipkin "github.com/openzipkin/zipkin-go-opentracing"
+	zipkinot "github.com/openzipkin-contrib/zipkin-go-opentracing"
+	"github.com/openzipkin/zipkin-go"
+	httpreporter "github.com/openzipkin/zipkin-go/reporter/http"
+
+	"github.com/prometheus/client_golang/prometheus"
 	stdprometheus "github.com/prometheus/client_golang/prometheus"
 	commonMiddleware "github.com/weaveworks/common/middleware"
 )
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 var (
 	port string
@@ -34,6 +46,24 @@ var (
 		Help:    "Time (in seconds) spent serving HTTP requests.",
 		Buckets: stdprometheus.DefBuckets,
 	}, []string{"method", "path", "status_code", "isWS"})
+
+	HTTPRequestActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "http_request_active",
+		Help: "The number of HTTP requests currently being handled.",
+	}, []string{"method", "path"})
+
+	HTTPRequestSizeBytes = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "http_request_size_bytes",
+		Help: "Size of HTTP request bodies in bytes.",
+		// Exponential buckets are better for sizes (e.g., 100B to 10MB).
+		Buckets: prometheus.ExponentialBuckets(100, 10, 6),
+	}, []string{"method", "handler"})
+
+	HTTPResponseSizeBytes = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_response_size_bytes",
+		Help:    "Size of HTTP response bodies in bytes.",
+		Buckets: prometheus.ExponentialBuckets(100, 10, 6),
+	}, []string{"method", "handler"})
 )
 
 const (
@@ -42,8 +72,11 @@ const (
 
 func init() {
 	stdprometheus.MustRegister(HTTPLatency)
+	stdprometheus.MustRegister(HTTPRequestActive)
+	stdprometheus.MustRegister(HTTPRequestSizeBytes)
+	stdprometheus.MustRegister(HTTPResponseSizeBytes)
 	flag.StringVar(&zip, "zipkin", os.Getenv("ZIPKIN"), "Zipkin address")
-	flag.StringVar(&port, "port", "8084", "Port on which to run")
+	flag.StringVar(&port, "port", env("PORT", "8084"), "Port on which to run")
 	db.Register("mongodb", &mongodb.Mongo{})
 }
 
@@ -76,25 +109,31 @@ func main() {
 		if zip == "" {
 			tracer = stdopentracing.NoopTracer{}
 		} else {
-			logger := log.With(logger, "tracer", "Zipkin")
-			logger.Log("addr", zip)
-			collector, err := zipkin.NewHTTPCollector(
-				zip,
-				zipkin.HTTPLogger(logger),
+			// 2. Setup Zipkin Reporter (replaces NewHTTPCollector)
+			// Note: Use /api/v2/spans for modern Zipkin
+			reporter := httpreporter.NewReporter(zip)
+			defer reporter.Close()
+
+			// 3. Create Local Endpoint
+			endpoint, err := zipkin.NewEndpoint(ServiceName, fmt.Sprintf("%v:%v", host, port))
+			if err != nil {
+				logger.Log("err", err)
+				os.Exit(1)
+			}
+
+			// 4. Initialize Native Zipkin Tracer
+			nativeTracer, err := zipkin.NewTracer(
+				reporter,
+				zipkin.WithLocalEndpoint(endpoint),
 			)
 			if err != nil {
 				logger.Log("err", err)
 				os.Exit(1)
 			}
-			tracer, err = zipkin.NewTracer(
-				zipkin.NewRecorder(collector, false, fmt.Sprintf("%v:%v", host, port), ServiceName),
-			)
-			if err != nil {
-				logger.Log("err", err)
-				os.Exit(1)
-			}
+
+			// 5. Wrap for OpenTracing (replaces zipkin.NewRecorder)
+			tracer = zipkinot.Wrap(nativeTracer)
 		}
-		stdopentracing.InitGlobalTracer(tracer)
 	}
 	dbconn := false
 	for !dbconn {
@@ -142,8 +181,11 @@ func main() {
 
 	httpMiddleware := []commonMiddleware.Interface{
 		commonMiddleware.Instrument{
-			Duration:     HTTPLatency,
-			RouteMatcher: router,
+			Duration:         HTTPLatency,
+			RouteMatcher:     router,
+			InflightRequests: HTTPRequestActive,
+			RequestBodySize:  HTTPRequestSizeBytes,
+			ResponseBodySize: HTTPResponseSizeBytes,
 		},
 	}
 
