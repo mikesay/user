@@ -1,17 +1,20 @@
-FROM mongo:3
+FROM mongo:8.2.4
+
+USER root
 ADD ./scripts /tmp/scripts
+RUN chmod +x /tmp/scripts/mongo_create_insert.sh
 
-# Modify child mongo to use /data/db-accounts as dbpath (because /data/db wont persist the build because it is already a VOLUME)
-RUN mkdir -p /data/db-users \
-    && echo "dbpath = /data/db-users" > /etc/mongodb.conf \
-    && chown -R mongodb:mongodb /data/db-users
+# 1. Create custom dbpath
+RUN mkdir -p /data/db-users && chown -R mongodb:mongodb /data/db-users
 
-RUN su - mongodb && mongod --fork --logpath /var/log/mongodb.log --dbpath /data/db-users  \
+# 2. Start Mongo, run script, and shutdown properly
+# Note: Modern Mongo uses YAML config, but we pass --dbpath directly for the build step
+RUN su - mongodb -c "mongod --fork --logpath /tmp/mongodb.log --dbpath /data/db-users" \
     && /tmp/scripts/mongo_create_insert.sh \
-    && mongod --dbpath /data/db-users --shutdown \
-    && chown -R mongodb /data/db-users
+    && su - mongodb -c "mongod --dbpath /data/db-users --shutdown"
 
-# Make the new dir a VOLUME to persist it
+USER mongodb
 VOLUME /data/db-users
 
-CMD ["mongod", "--config", "/etc/mongodb.conf", "--smallfiles"]
+# 3. Use --dbpath in CMD (no-auth as requested)
+CMD ["mongod", "--dbpath", "/data/db-users", "--bind_ip_all"]

@@ -1,9 +1,9 @@
 function get_results(result) {
-    print(tojson(result));
+    printjson(result);
 }
 
 function insert_customer(object) {
-    print(db.customers.insert(object));
+    printjson(db.customers.insertOne(object));
 }
 
 insert_customer({
